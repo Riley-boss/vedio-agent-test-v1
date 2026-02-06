@@ -62,6 +62,41 @@ def extract_url(text):
     match = re.search(pattern, text)
     return match.group(1) if match else None
 
+def normalize_cell_value(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+def extract_url_from_row(row_data, preferred_col=""):
+    if preferred_col and preferred_col in row_data:
+        url = extract_url(row_data.get(preferred_col, ""))
+        if url:
+            return url
+
+    for candidate in ("视频链接", "链接", "URL", "url", "video_url", "作品链接", "抖音链接"):
+        if candidate in row_data:
+            url = extract_url(row_data.get(candidate, ""))
+            if url:
+                return url
+
+    for value in row_data.values():
+        url = extract_url(value)
+        if url:
+            return url
+    return None
+
+def build_dify_document_text(text, source_url, metadata):
+    lines = [
+        f"【视频来源】：{source_url}",
+        f"【处理时间】：{time.strftime('%Y-%m-%d')}",
+    ]
+    for key, value in metadata.items():
+        if value:
+            lines.append(f"【{key}】：{value}")
+    lines.append("")
+    lines.append(text)
+    return "\n".join(lines)
+
 def create_http_session():
     session = requests.Session()
     retry_strategy = Retry(
@@ -201,12 +236,12 @@ def transcribe_audio(client, file_path):
     except Exception as e:
         return f"转录失败: {str(e)}"
 
-def sync_to_dify(text, source_url, session):
+def sync_to_dify(text, source_url, metadata, session):
     try:
         api_key = DIFY_API_KEY if 'DIFY_API_KEY' in globals() else ""
         dataset_id = DIFY_DATASET_ID if 'DIFY_DATASET_ID' in globals() else ""
         if not api_key or not dataset_id:
-            return False, "Dify配置缺失"
+            return False, "Dify配置缺失", ""
         url = f"https://api.dify.ai/v1/datasets/{dataset_id}/document/create_by_text"
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -214,13 +249,26 @@ def sync_to_dify(text, source_url, session):
         }
         payload = {
             "name": f"视频分析_{int(time.time())}",
-            "text": f"【视频来源】：{source_url}\n【处理时间】：{time.strftime('%Y-%m-%d')}\n\n{text}",
+            "text": build_dify_document_text(text, source_url, metadata),
             "indexing_technique": "high_quality",
             "process_rule": {"mode": "automatic"}
         }
         resp = session.post(url, headers=headers, json=payload, timeout=(8, 20))
         if 200 <= resp.status_code < 300:
-            return True, "同步成功"
+            doc_id = ""
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    doc_id = str(
+                        data.get("id")
+                        or data.get("document_id")
+                        or data.get("data", {}).get("id")
+                        or data.get("data", {}).get("document", {}).get("id")
+                        or ""
+                    )
+            except Exception:
+                pass
+            return True, "同步成功", doc_id
         else:
             err_msg = ""
             try:
@@ -228,51 +276,89 @@ def sync_to_dify(text, source_url, session):
                 err_msg = data.get("message") or str(data)
             except Exception:
                 err_msg = resp.text
-            return False, err_msg[:200]
+            return False, err_msg[:200], ""
     except Exception as e:
-        return False, str(e)
+        return False, str(e), ""
 
 # --- UI 侧边栏（仅保留输入区域） ---
 uploaded_file = st.sidebar.file_uploader("Excel/CSV 批量上传", type=["xlsx", "xls", "csv"])
 input_text = st.sidebar.text_area("或输入链接 (一行一个)", height=100)
+preferred_url_column = st.sidebar.text_input("链接列名（可选）", value="链接")
+dealer_id_column = st.sidebar.text_input("经销商ID列名（可选）", value="经销商ID")
+enable_dedup = st.sidebar.checkbox("按经销商ID+链接去重（保序）", value=True)
 
 # --- UI 主界面 ---
 st.title("批量视频转文字工具")
 
 if st.button("开始处理", type="primary"):
-    valid_urls = []
+    input_records = []
+
     if input_text.strip():
         lines = input_text.strip().split("\n")
-        for line in lines:
+        for line_no, line in enumerate(lines, start=1):
             url = extract_url(line)
             if url:
-                valid_urls.append(url)
+                input_records.append({
+                    "video_url": url,
+                    "fields": {
+                        "输入来源": "手动输入",
+                        "源行号": str(line_no),
+                        "原始输入": line.strip()
+                    }
+                })
+
     if uploaded_file is not None:
         try:
             if uploaded_file.name.endswith(".csv"):
                 df_upload = pd.read_csv(uploaded_file)
             else:
                 df_upload = pd.read_excel(uploaded_file)
-            for _, row in df_upload.iterrows():
-                row_str = " ".join(row.astype(str).values)
-                url = extract_url(row_str)
+
+            selected_url_col = preferred_url_column.strip()
+            for row_idx, row in df_upload.iterrows():
+                row_data = {str(col): normalize_cell_value(row[col]) for col in df_upload.columns}
+                url = extract_url_from_row(row_data, preferred_col=selected_url_col)
                 if url:
-                    valid_urls.append(url)
+                    row_data["输入来源"] = "文件上传"
+                    row_data["源文件名"] = uploaded_file.name
+                    row_data["源行号"] = str(row_idx + 2)
+                    input_records.append({
+                        "video_url": url,
+                        "fields": row_data
+                    })
         except Exception as e:
             st.error(f"读取文件失败: {e}")
-    valid_urls = list(dict.fromkeys(valid_urls))
-    
-    if not valid_urls:
+
+    process_records = input_records
+    if enable_dedup and process_records:
+        deduped_records = []
+        seen = set()
+        selected_dealer_col = dealer_id_column.strip()
+
+        for record in process_records:
+            dealer_value = ""
+            if selected_dealer_col:
+                dealer_value = record["fields"].get(selected_dealer_col, "")
+            dedupe_key = (dealer_value, record["video_url"])
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            deduped_records.append(record)
+
+        if len(deduped_records) < len(process_records):
+            st.info(f"已按经销商ID+链接去重：{len(process_records)} -> {len(deduped_records)}")
+        process_records = deduped_records
+
+    if not process_records:
         st.warning("请先输入视频链接或上传文件")
     elif not SILICONFLOW_API_KEY:
         st.error("配置错误：API Key 为空，请检查 .streamlit/secrets.toml")
     else:
         client = OpenAI(api_key=SILICONFLOW_API_KEY, base_url=SILICONFLOW_BASE_URL)
         http_session = create_http_session()
-        results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
-        total = len(valid_urls)
+        total = len(process_records)
 
         max_workers = min(MAX_DOWNLOAD_WORKERS, max(1, total))
         status_text.text(f"开始并发准备音频，任务数: {total}，并发数: {max_workers}")
@@ -280,54 +366,60 @@ if st.button("开始处理", type="primary"):
         completed = 0
         ordered_results = [None] * total
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_item = {
-                executor.submit(download_video_via_api, url, PARSING_API_URL): (idx, url)
-                for idx, url in enumerate(valid_urls)
-            }
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_item = {
+                    executor.submit(download_video_via_api, record["video_url"], PARSING_API_URL): (idx, record)
+                    for idx, record in enumerate(process_records)
+                }
 
-            for future in as_completed(future_to_item):
-                idx, url = future_to_item[future]
-                status_text.text(f"正在转写: {url} (进度 {completed + 1}/{total})")
+                for future in as_completed(future_to_item):
+                    idx, record = future_to_item[future]
+                    url = record["video_url"]
+                    result_row = dict(record["fields"])
+                    result_row["原始链接"] = url
+                    status_text.text(f"正在转写: {url} (进度 {completed + 1}/{total})")
 
-                try:
-                    audio_path, err = future.result()
-                except Exception as e:
-                    audio_path, err = None, str(e)
+                    try:
+                        audio_path, err = future.result()
+                    except Exception as e:
+                        audio_path, err = None, str(e)
 
-                if audio_path and os.path.exists(audio_path):
-                    transcript = transcribe_audio(client, audio_path)
-                    if not transcript.startswith("转录失败"):
-                        ok, msg = sync_to_dify(transcript, url, http_session)
-                        sync_status = "成功" if ok else f"失败：{msg}"
-                        ordered_results[idx] = {
-                            "原始链接": url,
-                            "状态": "成功",
-                            "视频逐字稿": transcript,
-                            "知识库同步状态": sync_status
-                        }
+                    if audio_path and os.path.exists(audio_path):
+                        transcript = transcribe_audio(client, audio_path)
+                        if not transcript.startswith("转录失败"):
+                            metadata_for_dify = {
+                                key: value for key, value in result_row.items()
+                                if value and key not in {"视频逐字稿", "转写状态", "知识库同步状态", "错误原因", "Dify文档ID"}
+                            }
+                            ok, msg, doc_id = sync_to_dify(transcript, url, metadata_for_dify, http_session)
+                            result_row["转写状态"] = "成功"
+                            result_row["视频逐字稿"] = transcript
+                            result_row["知识库同步状态"] = "成功" if ok else f"失败：{msg}"
+                            result_row["Dify文档ID"] = doc_id
+                            result_row["错误原因"] = ""
+                        else:
+                            result_row["转写状态"] = "失败"
+                            result_row["视频逐字稿"] = ""
+                            result_row["知识库同步状态"] = "未同步"
+                            result_row["Dify文档ID"] = ""
+                            result_row["错误原因"] = transcript
+                        _safe_remove_dir(os.path.dirname(audio_path))
                     else:
-                        ordered_results[idx] = {
-                            "原始链接": url,
-                            "状态": "失败",
-                            "视频逐字稿": "",
-                            "知识库同步状态": "未同步"
-                        }
-                    _safe_remove_dir(os.path.dirname(audio_path))
-                else:
-                    st.error(f"❌ 失败: {url}\n\n**错误原因:** {err}")
-                    ordered_results[idx] = {
-                        "原始链接": url,
-                        "状态": "失败",
-                        "视频逐字稿": "",
-                        "知识库同步状态": "未同步"
-                    }
+                        st.error(f"❌ 失败: {url}\n\n**错误原因:** {err}")
+                        result_row["转写状态"] = "失败"
+                        result_row["视频逐字稿"] = ""
+                        result_row["知识库同步状态"] = "未同步"
+                        result_row["Dify文档ID"] = ""
+                        result_row["错误原因"] = err
 
-                completed += 1
-                progress_bar.progress(completed / total)
+                    ordered_results[idx] = result_row
+                    completed += 1
+                    progress_bar.progress(completed / total)
+        finally:
+            http_session.close()
 
         results = [item for item in ordered_results if item is not None]
-        http_session.close()
 
         status_text.text("处理完成")
         
