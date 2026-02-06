@@ -10,6 +10,11 @@ from io import BytesIO
 import time
 import random
 import json
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- 核心配置区 (安全读取) ---
 try:
@@ -30,6 +35,10 @@ st.set_page_config(page_title="批量视频转文字工具", layout="wide")
 
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 ASR_MODEL = "iic/SenseVoiceSmall"
+MAX_RETRIES_PARSE = 4
+MAX_RETRIES_DOWNLOAD = 4
+MAX_DOWNLOAD_WORKERS = 4
+MIN_VALID_VIDEO_BYTES = 64 * 1024
 
 # UA 池
 USER_AGENTS = [
@@ -53,99 +62,133 @@ def extract_url(text):
     match = re.search(pattern, text)
     return match.group(1) if match else None
 
-def download_video_via_api(douyin_url, parser_api_url, status_callback=None):
-    # 重试参数
-    MAX_RETRIES_PARSE = 3
-    MAX_RETRIES_DOWNLOAD = 3
-    
-    # 1. 解析阶段重试
+def create_http_session():
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def build_parser_request_url(parser_api_url, douyin_url):
+    parsed = urlparse(parser_api_url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["url"] = douyin_url
+    new_query = urlencode(query)
+    return urlunparse(parsed._replace(query=new_query))
+
+def _extract_video_url_from_any(data):
+    if isinstance(data, str):
+        url = extract_url(data)
+        if url:
+            return url
+        return None
+    if isinstance(data, list):
+        for item in data:
+            url = _extract_video_url_from_any(item)
+            if url:
+                return url
+        return None
+    if isinstance(data, dict):
+        for key in ("url", "video_url", "play_addr", "download_url", "play_url"):
+            value = data.get(key)
+            if isinstance(value, str) and value.startswith("http"):
+                return value
+        for value in data.values():
+            url = _extract_video_url_from_any(value)
+            if url:
+                return url
+    return None
+
+def _safe_remove_dir(path):
+    if path and os.path.exists(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+def download_video_via_api(douyin_url, parser_api_url):
     video_url = None
     parse_error = None
-    
-    if '?' in parser_api_url:
-        api_full_url = f"{parser_api_url}&url={douyin_url}"
-    else:
-        api_full_url = f"{parser_api_url}?url={douyin_url}"
-        
-    for i in range(MAX_RETRIES_PARSE):
-        try:
-            if i > 0 and status_callback:
-                status_callback(f":gray[连接不稳定，正在重试... ({i+1}/{MAX_RETRIES_PARSE})]")
-            
-            headers_parse = get_random_header()
-            print(f"DEBUG: 请求解析API URL: {api_full_url}")
-            response = requests.get(api_full_url, headers=headers_parse, timeout=15)
-            print(f"DEBUG: 解析API返回状态: {response.status_code}, 响应前200字符: {response.text[:200]}")
-            response.raise_for_status()
-            data = response.json()
-            
-            if isinstance(data, dict):
-                if "data" in data and isinstance(data["data"], dict):
-                    video_url = data["data"].get("url") or data["data"].get("play_addr")
-                elif "url" in data:
-                    video_url = data["url"]
-                elif "video_url" in data:
-                    video_url = data["video_url"]
-            
-            if video_url:
-                break # 成功拿到 URL
-            else:
-                parse_error = f"未找到视频 URL. 返回: {str(data)[:200]}"
-                time.sleep(3) # 解析失败等待
-                
-        except Exception as e:
-            parse_error = str(e)
-            time.sleep(3) # 异常等待
-            
-    if not video_url:
-        return None, f"解析彻底失败: {parse_error}"
+    api_full_url = build_parser_request_url(parser_api_url, douyin_url)
+    session = create_http_session()
 
-    # 2. 下载阶段重试
-    temp_dir = tempfile.mkdtemp()
-    mp4_path = os.path.join(temp_dir, "video.mp4")
-    download_success = False
-    download_error = None
-    
-    for i in range(MAX_RETRIES_DOWNLOAD):
-        try:
-            if i > 0 and status_callback:
-                status_callback(f":gray[连接不稳定，正在重试... ({i+1}/{MAX_RETRIES_DOWNLOAD})]")
-                
-            headers_download = get_random_header()
-            video_resp = requests.get(video_url, headers=headers_download, stream=True, timeout=30)
-            video_resp.raise_for_status()
-            
-            with open(mp4_path, "wb") as f:
-                for chunk in video_resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            download_success = True
-            break
-        except Exception as e:
-            download_error = str(e)
-            time.sleep(5) # 下载失败等待
-            
-    if not download_success:
-        return None, f"下载彻底失败: {download_error}"
-
-    # 3. 转码音频
     try:
-        mp3_path = os.path.join(temp_dir, "audio.mp3")
-        command = [
-            "ffmpeg", "-y",
-            "-i", mp4_path,
-            "-vn",
-            "-acodec", "libmp3lame",
-            "-q:a", "4",
-            mp3_path
-        ]
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        os.remove(mp4_path) # 立即删除 mp4
-        return mp3_path, "ok"
-    except Exception as e:
-        if os.path.exists(mp4_path):
-            os.remove(mp4_path)
-        return None, f"转码失败: {str(e)}"
+        for i in range(MAX_RETRIES_PARSE):
+            try:
+                headers_parse = get_random_header()
+                response = session.get(api_full_url, headers=headers_parse, timeout=(8, 20))
+                response.raise_for_status()
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = response.text
+
+                video_url = _extract_video_url_from_any(data)
+                if video_url and video_url.startswith("http"):
+                    break
+                parse_error = f"未找到视频URL，响应片段: {str(data)[:200]}"
+            except Exception as e:
+                parse_error = str(e)
+
+            if i < MAX_RETRIES_PARSE - 1:
+                time.sleep((1.5 ** i) + random.uniform(0.2, 0.8))
+
+        if not video_url:
+            return None, f"解析彻底失败: {parse_error}"
+
+        temp_dir = tempfile.mkdtemp(prefix="video_asr_")
+        mp4_path = os.path.join(temp_dir, "video.mp4")
+        download_error = None
+
+        for i in range(MAX_RETRIES_DOWNLOAD):
+            try:
+                headers_download = get_random_header()
+                with session.get(video_url, headers=headers_download, stream=True, timeout=(10, 60), allow_redirects=True) as video_resp:
+                    video_resp.raise_for_status()
+                    downloaded = 0
+                    with open(mp4_path, "wb") as f:
+                        for chunk in video_resp.iter_content(chunk_size=256 * 1024):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded += len(chunk)
+
+                if downloaded < MIN_VALID_VIDEO_BYTES:
+                    raise ValueError(f"下载文件过小({downloaded} bytes)，疑似无效视频")
+
+                mp3_path = os.path.join(temp_dir, "audio.mp3")
+                command = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", mp4_path,
+                    "-vn",
+                    "-acodec", "libmp3lame",
+                    "-q:a", "4",
+                    mp3_path
+                ]
+                subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if os.path.exists(mp4_path):
+                    os.remove(mp4_path)
+                return mp3_path, "ok"
+            except subprocess.CalledProcessError as e:
+                download_error = e.stderr.decode("utf-8", errors="ignore")[:200] or str(e)
+            except Exception as e:
+                download_error = str(e)
+
+            if os.path.exists(mp4_path):
+                os.remove(mp4_path)
+            if i < MAX_RETRIES_DOWNLOAD - 1:
+                time.sleep((1.8 ** i) + random.uniform(0.2, 0.8))
+
+        _safe_remove_dir(temp_dir)
+        return None, f"下载彻底失败: {download_error}"
+    finally:
+        session.close()
 
 def transcribe_audio(client, file_path):
     try:
@@ -158,7 +201,7 @@ def transcribe_audio(client, file_path):
     except Exception as e:
         return f"转录失败: {str(e)}"
 
-def sync_to_dify(text, source_url):
+def sync_to_dify(text, source_url, session):
     try:
         api_key = DIFY_API_KEY if 'DIFY_API_KEY' in globals() else ""
         dataset_id = DIFY_DATASET_ID if 'DIFY_DATASET_ID' in globals() else ""
@@ -175,7 +218,7 @@ def sync_to_dify(text, source_url):
             "indexing_technique": "high_quality",
             "process_rule": {"mode": "automatic"}
         }
-        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        resp = session.post(url, headers=headers, json=payload, timeout=(8, 20))
         if 200 <= resp.status_code < 300:
             return True, "同步成功"
         else:
@@ -217,7 +260,7 @@ if st.button("开始处理", type="primary"):
                     valid_urls.append(url)
         except Exception as e:
             st.error(f"读取文件失败: {e}")
-    valid_urls = list(set(valid_urls))
+    valid_urls = list(dict.fromkeys(valid_urls))
     
     if not valid_urls:
         st.warning("请先输入视频链接或上传文件")
@@ -225,65 +268,66 @@ if st.button("开始处理", type="primary"):
         st.error("配置错误：API Key 为空，请检查 .streamlit/secrets.toml")
     else:
         client = OpenAI(api_key=SILICONFLOW_API_KEY, base_url=SILICONFLOW_BASE_URL)
+        http_session = create_http_session()
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         total = len(valid_urls)
-        
-        for i, url in enumerate(valid_urls):
-            current_progress_text = f"正在处理: {url} (进度 {i+1}/{total})"
-            status_text.text(current_progress_text)
-            
-            # 定义回调函数更新 UI 状态
-            def update_status(msg):
-                status_text.markdown(msg) # 使用 markdown 支持颜色
-                
-            audio_path, err = download_video_via_api(url, PARSING_API_URL, status_callback=update_status)
-            
-            if audio_path and os.path.exists(audio_path):
-                # 状态保持显示正在处理，不刷屏
-                transcript = transcribe_audio(client, audio_path)
-                if not transcript.startswith("转录失败"):
-                    ok, msg = sync_to_dify(transcript, url)
-                    if ok:
-                        update_status(":green[Dify同步成功]")
-                        sync_status = "成功"
+
+        max_workers = min(MAX_DOWNLOAD_WORKERS, max(1, total))
+        status_text.text(f"开始并发准备音频，任务数: {total}，并发数: {max_workers}")
+
+        completed = 0
+        ordered_results = [None] * total
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_item = {
+                executor.submit(download_video_via_api, url, PARSING_API_URL): (idx, url)
+                for idx, url in enumerate(valid_urls)
+            }
+
+            for future in as_completed(future_to_item):
+                idx, url = future_to_item[future]
+                status_text.text(f"正在转写: {url} (进度 {completed + 1}/{total})")
+
+                try:
+                    audio_path, err = future.result()
+                except Exception as e:
+                    audio_path, err = None, str(e)
+
+                if audio_path and os.path.exists(audio_path):
+                    transcript = transcribe_audio(client, audio_path)
+                    if not transcript.startswith("转录失败"):
+                        ok, msg = sync_to_dify(transcript, url, http_session)
+                        sync_status = "成功" if ok else f"失败：{msg}"
+                        ordered_results[idx] = {
+                            "原始链接": url,
+                            "状态": "成功",
+                            "视频逐字稿": transcript,
+                            "知识库同步状态": sync_status
+                        }
                     else:
-                        update_status(f":red[Dify同步失败：{msg}]")
-                        sync_status = f"失败：{msg}"
-                    results.append({
-                        "原始链接": url,
-                        "状态": "成功",
-                        "视频逐字稿": transcript,
-                        "知识库同步状态": sync_status
-                    })
+                        ordered_results[idx] = {
+                            "原始链接": url,
+                            "状态": "失败",
+                            "视频逐字稿": "",
+                            "知识库同步状态": "未同步"
+                        }
+                    _safe_remove_dir(os.path.dirname(audio_path))
                 else:
-                    results.append({
+                    st.error(f"❌ 失败: {url}\n\n**错误原因:** {err}")
+                    ordered_results[idx] = {
                         "原始链接": url,
                         "状态": "失败",
                         "视频逐字稿": "",
                         "知识库同步状态": "未同步"
-                    })
-                try:
-                    os.remove(audio_path)
-                    os.rmdir(os.path.dirname(audio_path))
-                except:
-                    pass
-            else:
-                st.error(f"❌ 失败: {url}\n\n**错误原因:** {err}")
-                results.append({
-                    "原始链接": url,
-                    "状态": "失败",
-                    "视频逐字稿": "",
-                    "知识库同步状态": "未同步"
-                })
-            
-            progress_bar.progress((i + 1) / total)
-            
-            # 防风控：随机延时 (静默处理，不显示倒计时干扰用户)
-            if i < total - 1:
-                sleep_time = random.uniform(2, 5)
-                time.sleep(sleep_time)
+                    }
+
+                completed += 1
+                progress_bar.progress(completed / total)
+
+        results = [item for item in ordered_results if item is not None]
+        http_session.close()
 
         status_text.text("处理完成")
         
