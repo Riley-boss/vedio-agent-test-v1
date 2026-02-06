@@ -39,6 +39,7 @@ MAX_RETRIES_PARSE = 4
 MAX_RETRIES_DOWNLOAD = 4
 MAX_DOWNLOAD_WORKERS = 4
 MIN_VALID_VIDEO_BYTES = 64 * 1024
+MAX_PARSE_CANDIDATES = 8
 
 # UA 池
 USER_AGENTS = [
@@ -52,7 +53,9 @@ USER_AGENTS = [
 def get_random_header():
     return {
         "User-Agent": random.choice(USER_AGENTS),
-        "Referer": "https://www.douyin.com/"
+        "Referer": "https://www.douyin.com/",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Connection": "keep-alive"
     }
 
 def extract_url(text):
@@ -61,6 +64,68 @@ def extract_url(text):
     pattern = r'(https?://[^\s]+)'
     match = re.search(pattern, text)
     return match.group(1) if match else None
+
+def sanitize_url(raw_url):
+    if not raw_url:
+        return ""
+    cleaned = str(raw_url).strip()
+    cleaned = cleaned.rstrip("，。；、!?！？\"'】）)>")
+    return cleaned
+
+def extract_video_id(url):
+    if not url:
+        return None
+    patterns = [
+        r"/video/(\d+)",
+        r"/share/video/(\d+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    try:
+        parsed = urlparse(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        for key in ("item_id", "aweme_id"):
+            if query.get(key, "").isdigit():
+                return query[key]
+    except Exception:
+        pass
+    return None
+
+def resolve_redirect_url(session, url):
+    try:
+        headers = get_random_header()
+        resp = session.get(url, headers=headers, timeout=(8, 20), allow_redirects=True)
+        final_url = sanitize_url(resp.url)
+        return final_url or sanitize_url(url)
+    except Exception:
+        return sanitize_url(url)
+
+def build_parse_candidates(session, douyin_url):
+    candidates = []
+    seen = set()
+
+    def _add(candidate):
+        value = sanitize_url(candidate)
+        if value and value not in seen:
+            candidates.append(value)
+            seen.add(value)
+
+    base_url = sanitize_url(douyin_url)
+    _add(base_url)
+
+    redirected_url = resolve_redirect_url(session, base_url)
+    _add(redirected_url)
+
+    video_id = extract_video_id(base_url) or extract_video_id(redirected_url)
+    if video_id:
+        _add(f"https://www.douyin.com/video/{video_id}")
+        _add(f"https://www.douyin.com/share/video/{video_id}/")
+        _add(f"https://www.iesdouyin.com/share/video/{video_id}/")
+        _add(f"https://www.douyin.com/discover?modal_id={video_id}")
+
+    return candidates[:MAX_PARSE_CANDIDATES]
 
 def normalize_cell_value(value):
     if pd.isna(value):
@@ -150,32 +215,39 @@ def _safe_remove_dir(path):
 def download_video_via_api(douyin_url, parser_api_url):
     video_url = None
     parse_error = None
-    api_full_url = build_parser_request_url(parser_api_url, douyin_url)
     session = create_http_session()
 
     try:
-        for i in range(MAX_RETRIES_PARSE):
-            try:
-                headers_parse = get_random_header()
-                response = session.get(api_full_url, headers=headers_parse, timeout=(8, 20))
-                response.raise_for_status()
+        parse_candidates = build_parse_candidates(session, douyin_url)
+        for candidate_idx, candidate_url in enumerate(parse_candidates):
+            api_full_url = build_parser_request_url(parser_api_url, candidate_url)
+            for i in range(MAX_RETRIES_PARSE):
                 try:
-                    data = response.json()
-                except ValueError:
-                    data = response.text
+                    headers_parse = get_random_header()
+                    response = session.get(api_full_url, headers=headers_parse, timeout=(8, 20))
+                    response.raise_for_status()
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        data = response.text
 
-                video_url = _extract_video_url_from_any(data)
-                if video_url and video_url.startswith("http"):
-                    break
-                parse_error = f"未找到视频URL，响应片段: {str(data)[:200]}"
-            except Exception as e:
-                parse_error = str(e)
+                    video_url = _extract_video_url_from_any(data)
+                    if video_url and video_url.startswith("http"):
+                        break
+                    parse_error = f"候选{candidate_idx + 1}解析失败，响应片段: {str(data)[:200]}"
+                except Exception as e:
+                    parse_error = str(e)
 
-            if i < MAX_RETRIES_PARSE - 1:
-                time.sleep((1.5 ** i) + random.uniform(0.2, 0.8))
+                if i < MAX_RETRIES_PARSE - 1:
+                    time.sleep((1.4 ** i) + random.uniform(0.2, 0.7))
+
+            if video_url:
+                break
+            if candidate_idx < len(parse_candidates) - 1:
+                time.sleep(random.uniform(0.2, 0.6))
 
         if not video_url:
-            return None, f"解析彻底失败: {parse_error}"
+            return None, f"解析彻底失败: {parse_error}，已尝试候选链接数: {len(parse_candidates)}"
 
         temp_dir = tempfile.mkdtemp(prefix="video_asr_")
         mp4_path = os.path.join(temp_dir, "video.mp4")
