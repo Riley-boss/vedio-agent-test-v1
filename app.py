@@ -212,6 +212,17 @@ def _safe_remove_dir(path):
     if path and os.path.exists(path):
         shutil.rmtree(path, ignore_errors=True)
 
+def is_valid_video_content_type(content_type):
+    if not content_type:
+        return False
+    value = content_type.lower()
+    return ("video/" in value) or ("octet-stream" in value)
+
+def transcript_effective_length(text):
+    if not text:
+        return 0
+    return len(re.sub(r"\s+", "", str(text)))
+
 def download_video_via_api(douyin_url, parser_api_url):
     video_url = None
     parse_error = None
@@ -258,6 +269,9 @@ def download_video_via_api(douyin_url, parser_api_url):
                 headers_download = get_random_header()
                 with session.get(video_url, headers=headers_download, stream=True, timeout=(10, 60), allow_redirects=True) as video_resp:
                     video_resp.raise_for_status()
+                    content_type = video_resp.headers.get("Content-Type", "")
+                    if not is_valid_video_content_type(content_type):
+                        raise ValueError(f"下载内容类型异常: {content_type}")
                     downloaded = 0
                     with open(mp4_path, "wb") as f:
                         for chunk in video_resp.iter_content(chunk_size=256 * 1024):
@@ -460,19 +474,24 @@ if st.button("开始处理", type="primary"):
                     if audio_path and os.path.exists(audio_path):
                         transcript = transcribe_audio(client, audio_path)
                         if not transcript.startswith("转录失败"):
+                            effective_len = transcript_effective_length(transcript)
+                            result_row["转写状态"] = "成功"
+                            result_row["视频逐字稿"] = transcript
+                            result_row["转写字符数"] = effective_len
                             metadata_for_dify = {
                                 key: value for key, value in result_row.items()
                                 if value and key not in {"视频逐字稿", "转写状态", "知识库同步状态", "错误原因", "Dify文档ID"}
                             }
                             ok, msg, doc_id = sync_to_dify(transcript, url, metadata_for_dify, http_session)
-                            result_row["转写状态"] = "成功"
-                            result_row["视频逐字稿"] = transcript
+                            result_row["是否入库"] = "是" if ok else "否"
                             result_row["知识库同步状态"] = "成功" if ok else f"失败：{msg}"
                             result_row["Dify文档ID"] = doc_id
-                            result_row["错误原因"] = ""
+                            result_row["错误原因"] = "" if ok else msg
                         else:
                             result_row["转写状态"] = "失败"
                             result_row["视频逐字稿"] = ""
+                            result_row["转写字符数"] = 0
+                            result_row["是否入库"] = "否"
                             result_row["知识库同步状态"] = "未同步"
                             result_row["Dify文档ID"] = ""
                             result_row["错误原因"] = transcript
@@ -481,6 +500,8 @@ if st.button("开始处理", type="primary"):
                         st.error(f"❌ 失败: {url}\n\n**错误原因:** {err}")
                         result_row["转写状态"] = "失败"
                         result_row["视频逐字稿"] = ""
+                        result_row["转写字符数"] = 0
+                        result_row["是否入库"] = "否"
                         result_row["知识库同步状态"] = "未同步"
                         result_row["Dify文档ID"] = ""
                         result_row["错误原因"] = err
