@@ -151,15 +151,22 @@ def extract_url_from_row(row_data, preferred_col=""):
     return None
 
 def build_dify_document_text(text, source_url, metadata):
-    lines = [
-        f"【视频来源】：{source_url}",
-        f"【处理时间】：{time.strftime('%Y-%m-%d')}",
-    ]
+    lines = [build_structured_summary(metadata, source_url)]
+    lines.extend([
+        "",
+        "【元数据】",
+        f"视频来源: {source_url}",
+        f"处理时间: {time.strftime('%Y-%m-%d')}",
+    ])
     for key, value in metadata.items():
         if value:
-            lines.append(f"【{key}】：{value}")
-    lines.append("")
-    lines.append(text)
+            lines.append(f"{key}: {value}")
+    lines.extend([
+        "",
+        "【转写正文开始】",
+        text if text is not None else "",
+        "【转写正文结束】",
+    ])
     return "\n".join(lines)
 
 def create_http_session():
@@ -222,6 +229,70 @@ def transcript_effective_length(text):
     if not text:
         return 0
     return len(re.sub(r"\s+", "", str(text)))
+
+def remove_emoji(text):
+    if not text:
+        return ""
+    emoji_pattern = re.compile(
+        "[" 
+        "\U0001F300-\U0001F5FF"
+        "\U0001F600-\U0001F64F"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F700-\U0001F77F"
+        "\U0001F780-\U0001F7FF"
+        "\U0001F800-\U0001F8FF"
+        "\U0001F900-\U0001F9FF"
+        "\U0001FA00-\U0001FA6F"
+        "\U0001FA70-\U0001FAFF"
+        "\U00002700-\U000027BF"
+        "\U00002600-\U000026FF"
+        "]+",
+        flags=re.UNICODE,
+    )
+    cleaned = emoji_pattern.sub("", str(text))
+    cleaned = re.sub(r"[\u200d\ufe0f]", "", cleaned)
+    return cleaned.strip()
+
+def normalize_numeric_value(raw_value):
+    if raw_value is None:
+        return ""
+    text = str(raw_value).strip().replace(",", "")
+    if text == "":
+        return ""
+    match = re.search(r"-?\d+(\.\d+)?", text)
+    if not match:
+        return ""
+    return match.group(0)
+
+def extract_video_id_from_url(url):
+    return extract_video_id(url) or ""
+
+def build_document_name(metadata, source_url):
+    dealer_id = metadata.get("经销商ID", "").strip() or "unknownDealer"
+    title = metadata.get("视频标题", "").strip() or "untitled"
+    video_id = extract_video_id_from_url(source_url) or f"ts{int(time.time())}"
+    safe_title = re.sub(r"[\\/:*?\"<>|]", "_", title)[:30]
+    return f"dealer_{dealer_id}__video_{video_id}__{safe_title}"
+
+def build_structured_summary(metadata, source_url):
+    fields = {
+        "video_id": extract_video_id_from_url(source_url),
+        "dealer_id": metadata.get("经销商ID", ""),
+        "dealer_name": metadata.get("经销商简称", ""),
+        "platform": metadata.get("社媒平台", ""),
+        "publish_time": metadata.get("发布时间", ""),
+        "title": metadata.get("视频标题", ""),
+        "car_series": metadata.get("视频车系", ""),
+        "play_count": normalize_numeric_value(metadata.get("播放量", "")),
+        "like_count": normalize_numeric_value(metadata.get("点赞量", "")),
+        "comment_count": normalize_numeric_value(metadata.get("评论量", "")),
+        "share_count": normalize_numeric_value(metadata.get("分享量", "")),
+        "engagement_count": normalize_numeric_value(metadata.get("互动量", "")),
+    }
+    lines = ["【结构化字段】"]
+    for key, value in fields.items():
+        lines.append(f"{key}: {value}")
+    return "\n".join(lines)
 
 def download_video_via_api(douyin_url, parser_api_url):
     video_url = None
@@ -334,7 +405,7 @@ def sync_to_dify(text, source_url, metadata, session):
             "Content-Type": "application/json"
         }
         payload = {
-            "name": f"视频分析_{int(time.time())}",
+            "name": build_document_name(metadata, source_url),
             "text": build_dify_document_text(text, source_url, metadata),
             "indexing_technique": "high_quality",
             "process_rule": {"mode": "automatic"}
@@ -474,15 +545,19 @@ if st.button("开始处理", type="primary"):
                     if audio_path and os.path.exists(audio_path):
                         transcript = transcribe_audio(client, audio_path)
                         if not transcript.startswith("转录失败"):
-                            effective_len = transcript_effective_length(transcript)
+                            cleaned_transcript = remove_emoji(transcript)
+                            effective_len = transcript_effective_length(cleaned_transcript)
                             result_row["转写状态"] = "成功"
-                            result_row["视频逐字稿"] = transcript
+                            result_row["视频逐字稿"] = cleaned_transcript
                             result_row["转写字符数"] = effective_len
                             metadata_for_dify = {
                                 key: value for key, value in result_row.items()
-                                if value and key not in {"视频逐字稿", "转写状态", "知识库同步状态", "错误原因", "Dify文档ID"}
+                                if value and key not in {
+                                    "视频逐字稿", "转写状态", "知识库同步状态", "错误原因", "Dify文档ID",
+                                    "转写字符数", "是否入库"
+                                }
                             }
-                            ok, msg, doc_id = sync_to_dify(transcript, url, metadata_for_dify, http_session)
+                            ok, msg, doc_id = sync_to_dify(cleaned_transcript, url, metadata_for_dify, http_session)
                             result_row["是否入库"] = "是" if ok else "否"
                             result_row["知识库同步状态"] = "成功" if ok else f"失败：{msg}"
                             result_row["Dify文档ID"] = doc_id
@@ -513,6 +588,10 @@ if st.button("开始处理", type="primary"):
             http_session.close()
 
         results = [item for item in ordered_results if item is not None]
+        hidden_output_fields = {"输入来源", "源文件名"}
+        for row in results:
+            for field in hidden_output_fields:
+                row.pop(field, None)
 
         status_text.text("处理完成")
         
